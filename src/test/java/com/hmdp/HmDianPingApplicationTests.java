@@ -22,6 +22,7 @@ import java.util.stream.Collectors;
 
 import static com.hmdp.utils.RedisConstants.CACHE_SHOP_KEY;
 import static com.hmdp.utils.RedisConstants.SHOP_GEO_KEY;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @SpringBootTest
 class HmDianPingApplicationTests {
@@ -39,6 +40,16 @@ class HmDianPingApplicationTests {
     private StringRedisTemplate stringRedisTemplate;
 
     private ExecutorService es = Executors.newFixedThreadPool(500);
+
+    @Test
+    void createsOrderStreamConsumerGroupOnStartup() {
+        boolean groupExists = stringRedisTemplate.opsForStream()
+                .groups("stream.orders")
+                .stream()
+                .anyMatch(group -> "g1".equals(group.groupName()));
+
+        assertTrue(groupExists);
+    }
 
     @Test
     void testIdWorker() throws InterruptedException {

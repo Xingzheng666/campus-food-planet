@@ -14,13 +14,16 @@ import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.connection.stream.*;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
 import javax.annotation.Resource;
 import java.time.Duration;
+import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -38,6 +41,9 @@ import java.util.concurrent.Executors;
 @Slf4j
 @Service
 public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
+
+    private static final String ORDER_STREAM_KEY = "stream.orders";
+    private static final String ORDER_STREAM_GROUP = "g1";
 
     @Resource
     private ISeckillVoucherService seckillVoucherService;
@@ -58,24 +64,49 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     }
 
 
-    private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
+    private final ExecutorService seckillOrderExecutor = Executors.newSingleThreadExecutor();
+    private volatile boolean running;
 
     @PostConstruct
     private void init() {
-        SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
+        running = true;
+        createOrderStreamGroup();
+        seckillOrderExecutor.submit(new VoucherOrderHandler());
+    }
+
+    @PreDestroy
+    private void destroy() {
+        running = false;
+        seckillOrderExecutor.shutdownNow();
+    }
+
+    private void createOrderStreamGroup() {
+        try {
+            stringRedisTemplate.execute((RedisCallback<String>) connection -> connection.streamCommands()
+                    .xGroupCreate(
+                            ORDER_STREAM_KEY.getBytes(StandardCharsets.UTF_8),
+                            ORDER_STREAM_GROUP,
+                            ReadOffset.from("0"),
+                            true
+                    ));
+        } catch (Exception e) {
+            if (e.getMessage() == null || !e.getMessage().contains("BUSYGROUP")) {
+                throw e;
+            }
+        }
     }
 
     private class VoucherOrderHandler implements Runnable {
 
         @Override
         public void run() {
-            while (true) {
+            while (running && !Thread.currentThread().isInterrupted()) {
                 try {
                     // 1.获取消息队列中的订单信息 XREADGROUP GROUP g1 c1 COUNT 1 BLOCK 2000 STREAMS s1 >
                     List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
-                            Consumer.from("g1", "c1"),
+                            Consumer.from(ORDER_STREAM_GROUP, "c1"),
                             StreamReadOptions.empty().count(1).block(Duration.ofSeconds(2)),
-                            StreamOffset.create("stream.orders", ReadOffset.lastConsumed())
+                            StreamOffset.create(ORDER_STREAM_KEY, ReadOffset.lastConsumed())
                     );
                     // 2.判断订单信息是否为空
                     if (list == null || list.isEmpty()) {
@@ -89,8 +120,11 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     // 3.创建订单
                     createVoucherOrder(voucherOrder);
                     // 4.确认消息 XACK
-                    stringRedisTemplate.opsForStream().acknowledge("s1", "g1", record.getId());
+                    stringRedisTemplate.opsForStream().acknowledge(ORDER_STREAM_KEY, ORDER_STREAM_GROUP, record.getId());
                 } catch (Exception e) {
+                    if (!running || Thread.currentThread().isInterrupted()) {
+                        break;
+                    }
                     log.error("处理订单异常", e);
                     handlePendingList();
                 }
@@ -98,13 +132,13 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
 
         private void handlePendingList() {
-            while (true) {
+            while (running && !Thread.currentThread().isInterrupted()) {
                 try {
                     // 1.获取pending-list中的订单信息 XREADGROUP GROUP g1 c1 COUNT 1 BLOCK 2000 STREAMS s1 0
                     List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
-                            Consumer.from("g1", "c1"),
+                            Consumer.from(ORDER_STREAM_GROUP, "c1"),
                             StreamReadOptions.empty().count(1),
-                            StreamOffset.create("stream.orders", ReadOffset.from("0"))
+                            StreamOffset.create(ORDER_STREAM_KEY, ReadOffset.from("0"))
                     );
                     // 2.判断订单信息是否为空
                     if (list == null || list.isEmpty()) {
@@ -118,9 +152,13 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     // 3.创建订单
                     createVoucherOrder(voucherOrder);
                     // 4.确认消息 XACK
-                    stringRedisTemplate.opsForStream().acknowledge("s1", "g1", record.getId());
+                    stringRedisTemplate.opsForStream().acknowledge(ORDER_STREAM_KEY, ORDER_STREAM_GROUP, record.getId());
                 } catch (Exception e) {
+                    if (!running || Thread.currentThread().isInterrupted()) {
+                        break;
+                    }
                     log.error("处理订单异常", e);
+                    break;
                 }
             }
         }
